@@ -88,7 +88,7 @@ class Sync(Base, metaclass=Singleton):
         )
         self.search_client: SearchClient = SearchClient()
         self.__name: str = re.sub(
-            "[^0-9a-zA-Z]+", "", f"{self.database.lower()}_{self.index}"
+            "[^0-9a-zA-Z]+", "", f"{self.database.lower()}"
         )
         self._checkpoint: int = None
         self._plugins: Plugins = None
