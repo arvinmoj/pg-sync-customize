@@ -365,7 +365,7 @@ def run_task(
         page: int = max(task.keys())
         row: int = max(task[page])
         filename: str = re.sub(
-            "[^0-9a-zA-Z]+", "", f"{sync.database.lower()}_{sync.index}"
+            "[^0-9a-zA-Z_]+", "", f"{sync.database.lower()}_{sync.index}"
         )
         save_ctid(page, row, filename)
 
@@ -409,7 +409,7 @@ def run_task(
     ),
     default="multiprocess_async",
 )
-def main(config, nprocs, mode, verbose):
+def main(config: str, nprocs: int, mode: str, verbose: bool) -> None:
     """
     TODO:
     - Track progress across cpus/threads

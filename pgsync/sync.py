@@ -1,3 +1,4 @@
+
 """Sync module."""
 
 import asyncio
@@ -82,13 +83,14 @@ class Sync(Base, metaclass=Singleton):
         self.nodes: dict = doc.get("nodes", {})
         self.setting: dict = doc.get("setting")
         self.mapping: dict = doc.get("mapping")
+        self.mappings: dict = doc.get("mappings")
         self.routing: str = doc.get("routing")
         super().__init__(
             doc.get("database", self.index), verbose=verbose, **kwargs
         )
         self.search_client: SearchClient = SearchClient()
         self.__name: str = re.sub(
-            "[^0-9a-zA-Z]+", "", f"{self.database.lower()}"
+            "[^0-9a-zA-Z]+", "", f"{self.database.lower()}_{self.index}"
         )
         self._checkpoint: int = None
         self._plugins: Plugins = None
@@ -108,6 +110,7 @@ class Sync(Base, metaclass=Singleton):
             self._plugins: Plugins = Plugins("plugins", self.plugins)
         self.query_builder: QueryBuilder = QueryBuilder(verbose=verbose)
         self.count: dict = dict(xlog=0, db=0, redis=0)
+        self.tasks: t.List[asyncio.Task] = []
 
     def validate(self, repl_slots: bool = True) -> None:
         """Perform all validation right away."""
@@ -255,6 +258,7 @@ class Sync(Base, metaclass=Singleton):
             self.tree,
             setting=self.setting,
             mapping=self.mapping,
+            mappings=self.mappings,
             routing=self.routing,
         )
 
@@ -348,6 +352,7 @@ class Sync(Base, metaclass=Singleton):
         txmin: t.Optional[int] = None,
         txmax: t.Optional[int] = None,
         upto_nchanges: t.Optional[int] = None,
+        upto_lsn: t.Optional[str] = None,
     ) -> None:
         """
         Process changes from the db logical replication logs.
@@ -375,25 +380,15 @@ class Sync(Base, metaclass=Singleton):
         # minimize the tmp file disk usage when calling
         # PG_LOGICAL_SLOT_PEEK_CHANGES and PG_LOGICAL_SLOT_GET_CHANGES
         # by limiting to a smaller batch size.
-        offset: int = 0
-        total: int = 0
-        limit: int = settings.LOGICAL_SLOT_CHUNK_SIZE
-        count: int = self.logical_slot_count_changes(
-            self.__name,
-            txmin=txmin,
-            txmax=txmax,
-            upto_nchanges=upto_nchanges,
-        )
         while True:
             changes: int = self.logical_slot_peek_changes(
                 self.__name,
                 txmin=txmin,
                 txmax=txmax,
                 upto_nchanges=upto_nchanges,
-                limit=limit,
-                offset=offset,
+                upto_lsn=upto_lsn,
             )
-            if not changes or total > count:
+            if not changes:
                 break
 
             rows: list = []
@@ -416,6 +411,11 @@ class Sync(Base, metaclass=Singleton):
                         f"Error parsing row: {e}\nRow data: {row.data}"
                     )
                     raise
+
+                # filter out unknown schemas
+                if payload.schema not in self.tree.schemas:
+                    continue
+
                 payloads.append(payload)
 
                 j: int = i + 1
@@ -448,11 +448,8 @@ class Sync(Base, metaclass=Singleton):
                 txmin=txmin,
                 txmax=txmax,
                 upto_nchanges=upto_nchanges,
-                limit=limit,
-                offset=offset,
+                upto_lsn=upto_lsn,
             )
-            offset += limit
-            total += len(changes)
             self.count["xlog"] += len(rows)
 
     def _root_primary_key_resolver(
@@ -820,7 +817,10 @@ class Sync(Base, metaclass=Singleton):
         # e.g a through table which we need to react to.
         # in this case, we find the parent of the through
         # table and force a re-sync.
-        if payload.table not in self.tree.tables:
+        if (
+            payload.table not in self.tree.tables
+            or payload.schema not in self.tree.schemas
+        ):
             return
 
         node: Node = self.tree.get_node(payload.table, payload.schema)
@@ -984,6 +984,18 @@ class Sync(Base, metaclass=Singleton):
 
                 row[META] = Transform.get_primary_keys(keys)
 
+                if node.is_root:
+                    primary_key_values: t.List[str] = list(
+                        map(str, primary_keys)
+                    )
+                    primary_key_names: t.List[str] = [
+                        primary_key.name for primary_key in node.primary_keys
+                    ]
+                    # TODO: add support for composite pkeys
+                    row[META][node.table] = {
+                        primary_key_names[0]: [primary_key_values[0]],
+                    }
+
                 if self.verbose:
                     print(f"{(i+1)})")
                     print(f"pkeys: {primary_keys}")
@@ -1121,7 +1133,11 @@ class Sync(Base, metaclass=Singleton):
                 notification: t.AnyStr = conn.notifies.pop(0)
                 if notification.channel == self.database:
                     payload = json.loads(notification.payload)
-                    if self.index in payload["indices"]:
+                    if (
+                        payload["indices"]
+                        and self.index in payload["indices"]
+                        and payload["schema"] in self.tree.schemas
+                    ):
                         payloads.append(payload)
                         logger.debug(f"poll_db: {payload}")
                         self.count["db"] += 1
@@ -1143,7 +1159,11 @@ class Sync(Base, metaclass=Singleton):
             notification: t.AnyStr = self.conn.notifies.pop(0)
             if notification.channel == self.database:
                 payload = json.loads(notification.payload)
-                if self.index in payload["indices"]:
+                if (
+                    payload["indices"]
+                    and self.index in payload["indices"]
+                    and payload["schema"] in self.tree.schemas
+                ):
                     self.redis.push([payload])
                     logger.debug(f"async_poll: {payload}")
                     self.count["db"] += 1
@@ -1225,13 +1245,22 @@ class Sync(Base, metaclass=Singleton):
         """Pull data from db."""
         txmin: int = self.checkpoint
         txmax: int = self.txid_current
+        # this is the max lsn we should go upto
+        upto_lsn: str = self.current_wal_lsn
+        upto_nchanges: int = settings.LOGICAL_SLOT_CHUNK_SIZE
+
         logger.debug(f"pull txmin: {txmin} - txmax: {txmax}")
         # forward pass sync
         self.search_client.bulk(
             self.index, self.sync(txmin=txmin, txmax=txmax)
         )
         # now sync up to txmax to capture everything we may have missed
-        self.logical_slot_changes(txmin=txmin, txmax=txmax, upto_nchanges=None)
+        self.logical_slot_changes(
+            txmin=txmin,
+            txmax=txmax,
+            upto_nchanges=upto_nchanges,
+            upto_lsn=upto_lsn,
+        )
         self.checkpoint: int = txmax or self.txid_current
         self._truncate = True
 
@@ -1268,6 +1297,7 @@ class Sync(Base, metaclass=Singleton):
             await asyncio.sleep(settings.LOG_INTERVAL)
 
     def _status(self, label: str) -> None:
+        # TODO: indicate if we are processing logical logs or not
         sys.stdout.write(
             f"{label} {self.database}:{self.index} "
             f"Xlog: [{self.count['xlog']:,}] => "
@@ -1295,13 +1325,11 @@ class Sync(Base, metaclass=Singleton):
             cursor.execute(f'LISTEN "{self.database}"')
             event_loop = asyncio.get_event_loop()
             event_loop.add_reader(self.conn, self.async_poll_db)
-            tasks: list = [
+            self.tasks: t.List[asyncio.Task] = [
                 event_loop.create_task(self.async_poll_redis()),
                 event_loop.create_task(self.async_truncate_slots()),
                 event_loop.create_task(self.async_status()),
             ]
-            event_loop.run_until_complete(asyncio.wait(tasks))
-            event_loop.close()
 
         else:
             # sync up to and produce items in the Redis cache
@@ -1414,22 +1442,22 @@ class Sync(Base, metaclass=Singleton):
     default=settings.NUM_WORKERS,
 )
 def main(
-    config,
-    daemon,
-    host,
-    password,
-    port,
-    sslmode,
-    sslrootcert,
-    user,
-    verbose,
-    version,
-    analyze,
-    num_workers,
-    polling,
-    producer,
-    consumer,
-):
+    config: str,
+    daemon: bool,
+    host: str,
+    password: bool,
+    port: int,
+    sslmode: str,
+    sslrootcert: str,
+    user: str,
+    verbose: bool,
+    version: bool,
+    analyze: bool,
+    num_workers: int,
+    polling: bool,
+    producer: bool,
+    consumer: bool,
+) -> None:
     """Main application syncer."""
     if version:
         sys.stdout.write(f"Version: {__version__}\n")
@@ -1477,6 +1505,7 @@ def main(
                 time.sleep(settings.POLL_INTERVAL)
 
         else:
+            tasks: t.List[asyncio.Task] = []
             for doc in config_loader(config):
                 sync: Sync = Sync(
                     doc,
@@ -1489,6 +1518,12 @@ def main(
                 sync.pull()
                 if daemon:
                     sync.receive()
+                    tasks.extend(sync.tasks)
+
+            if settings.USE_ASYNC:
+                event_loop = asyncio.get_event_loop()
+                event_loop.run_until_complete(asyncio.gather(*tasks))
+                event_loop.close()
 
 
 if __name__ == "__main__":
